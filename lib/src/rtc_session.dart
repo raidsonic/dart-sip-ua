@@ -2008,14 +2008,63 @@ class RTCSession extends EventManager implements Owner {
       return true;
     }
 
-    RTCSessionDescription? desc = await _processInDialogSdpOffer(request);
+    final Map<String, bool> parsedSDP = _parseInDialogSdpOffer(request);
 
-    Future<bool> acceptReInvite(dynamic options) async {
+    RTCSessionDescription? desc = await _processInDialogSdpOffer(request,
+        parsedSDP['hold']!);
+
+    Future<bool> acceptReInvite(Map<String, dynamic>? options) async {
       try {
         // Send answer.
         if (_state == RtcSessionState.terminated) {
           return false;
         }
+
+        if (parsedSDP['upgradeToVideo'] == true) {
+          Map<String, dynamic> mediaConstraints = options ?? <String, dynamic>{
+            'audio': true,
+            'video': <String, dynamic>{
+              'mandatory': <String, dynamic>{
+                'minWidth': '640',
+                'minHeight': '480',
+                'minFrameRate': '30',
+              },
+              'facingMode': 'user',
+            }
+          };
+          bool hasCamera = false;
+          try {
+            List<MediaDeviceInfo> devices =
+            await navigator.mediaDevices.enumerateDevices();
+            for (MediaDeviceInfo device in devices) {
+              if (device.kind == 'videoinput') hasCamera = true;
+            }
+          } catch (e) {
+            logger.w('Failed to enumerate devices: $e');
+          }
+          if (hasCamera) {
+            MediaStream localStream =
+            await navigator.mediaDevices.getUserMedia(mediaConstraints);
+            if (localStream.getVideoTracks().isEmpty) {
+              logger.w(
+                  'Remote wants to upgrade to video but failed to get local video');
+            }
+            for (MediaStreamTrack track in localStream.getTracks()) {
+              if (track.kind == 'video') {
+                _connection!.addTrack(track, localStream);
+                _localMediaStream?.addTrack(track);
+              }
+            }
+            emit(EventStream(
+                session: this,
+                originator: Originator.local,
+                stream: _localMediaStream));
+          } else {
+            logger.w(
+                'Remote wants to upgrade to video but no camera available to send');
+          }
+        }
+
         sendAnswer(desc.sdp);
       } catch (error) {
         logger.e('Got anerror on re-INVITE: ${error.toString()}');
@@ -2101,8 +2150,9 @@ class RTCSession extends EventManager implements Owner {
       return;
     }
 
+    final Map<String, bool> parsedSDP = _parseInDialogSdpOffer(request);
     try {
-      RTCSessionDescription desc = await _processInDialogSdpOffer(request);
+      RTCSessionDescription desc = await _processInDialogSdpOffer(request, parsedSDP['hold']!);
       if (_state == RtcSessionState.terminated) return;
       // Send answer.
       sendAnswer(desc.sdp);
@@ -2112,79 +2162,8 @@ class RTCSession extends EventManager implements Owner {
   }
 
   Future<RTCSessionDescription> _processInDialogSdpOffer(
-      IncomingRequest request) async {
+      IncomingRequest request, bool hold) async {
     logger.d('_processInDialogSdpOffer()');
-
-    Map<String, dynamic>? sdp = request.parseSDP();
-
-    bool hold = false;
-    bool upgradeToVideo = false;
-    if (sdp != null) {
-      List<dynamic> mediaList = sdp['media'];
-
-      // Loop media list items for video upgrade
-      for (Map<String, dynamic> media in mediaList) {
-        if (holdMediaTypes.indexOf(media['type']) == -1) continue;
-        if (media['type'] == 'video') upgradeToVideo = true;
-      }
-      // Loop media list items for hold
-      for (Map<String, dynamic> media in mediaList) {
-        if (holdMediaTypes.indexOf(media['type']) == -1) continue;
-        String direction = media['direction'] ?? sdp['direction'] ?? 'sendrecv';
-        if (direction == 'sendonly' || direction == 'inactive') {
-          hold = true;
-        }
-        // If at least one of the streams is active don't emit 'hold'.
-        else {
-          hold = false;
-        }
-      }
-    }
-
-    if (upgradeToVideo) {
-      Map<String, dynamic> mediaConstraints = <String, dynamic>{
-        'audio': true,
-        'video': <String, dynamic>{
-          'mandatory': <String, dynamic>{
-            'minWidth': '640',
-            'minHeight': '480',
-            'minFrameRate': '30',
-          },
-          'facingMode': 'user',
-        }
-      };
-      bool hasCamera = false;
-      try {
-        List<MediaDeviceInfo> devices =
-            await navigator.mediaDevices.enumerateDevices();
-        for (MediaDeviceInfo device in devices) {
-          if (device.kind == 'videoinput') hasCamera = true;
-        }
-      } catch (e) {
-        logger.w('Failed to enumerate devices: $e');
-      }
-      if (hasCamera) {
-        MediaStream localStream =
-            await navigator.mediaDevices.getUserMedia(mediaConstraints);
-        if (localStream.getVideoTracks().isEmpty) {
-          logger.w(
-              'Remote wants to upgrade to video but failed to get local video');
-        }
-        for (MediaStreamTrack track in localStream.getTracks()) {
-          if (track.kind == 'video') {
-            _connection!.addTrack(track, localStream);
-            _localMediaStream?.addTrack(track);
-          }
-        }
-        emit(EventStream(
-            session: this,
-            originator: Originator.local,
-            stream: _localMediaStream));
-      } else {
-        logger.w(
-            'Remote wants to upgrade to video but no camera available to send');
-      }
-    }
 
     logger.d('emit "sdp"');
     final String? processedSDP = _sdpOfferToWebRTC(request.body);
@@ -2223,7 +2202,6 @@ class RTCSession extends EventManager implements Owner {
     }
 
     // Create local description.
-
     if (_state == RtcSessionState.terminated) {
       throw Exceptions.InvalidStateError('terminated');
     }
@@ -2235,6 +2213,40 @@ class RTCSession extends EventManager implements Owner {
       request.reply(500);
       throw Exceptions.TypeError('_createLocalDescription() failed');
     }
+  }
+
+  /*
+   * Parse InDialogOffer
+   */
+  Map<String, bool> _parseInDialogSdpOffer(IncomingRequest request) {
+    Map<String, dynamic>? sdp = request.parseSDP();
+
+    bool hold = false;
+    bool upgradeToVideo = false;
+    if (sdp != null) {
+      List<dynamic> mediaList = sdp['media'];
+
+      // Loop media list items for video upgrade
+      for (Map<String, dynamic> media in mediaList) {
+        if (holdMediaTypes.indexOf(media['type']) == -1) continue;
+        if (media['type'] == 'video') upgradeToVideo = true;
+      }
+      // Loop media list items for hold
+      for (Map<String, dynamic> media in mediaList) {
+        if (holdMediaTypes.indexOf(media['type']) == -1) continue;
+        String direction = media['direction'] ?? sdp['direction'] ?? 'sendrecv';
+        if (direction == 'sendonly' || direction == 'inactive') {
+          hold = true;
+        }
+        else {
+          hold = false;
+        }
+      }
+    }
+    return <String, bool>{
+      'hold': hold,
+      'upgradeToVideo': upgradeToVideo,
+    };
   }
 
   /**
